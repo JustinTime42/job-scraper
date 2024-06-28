@@ -2,8 +2,11 @@ import requests
 from bs4 import BeautifulSoup
 import re
 import csv
+from urllib.parse import urlparse, urlunparse, urljoin
+import concurrent.futures
+from collections import deque
 
-visited_urls = []
+visited_urls = set()
 likely_careers_page = ""
 def extract_page_info(url):
     """
@@ -11,11 +14,12 @@ def extract_page_info(url):
     finds email addresses on a given website page, and saves it to a CSV file.
     """
 
+    fixed_url = fix_url(url)
     try:
         request_headers = {
             'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         }
-        response = requests.get(url, headers=request_headers)
+        response = requests.get(fixed_url, headers=request_headers)
     except requests.exceptions.RequestException as e:
         print(f"Failed to fetch the webpage: {e}")
         return
@@ -31,23 +35,29 @@ def extract_page_info(url):
     metadata['description'] = extract_description(soup)
     email_addresses = []
     careers_page = []
-    site_map = create_site_map(soup, url, [])
-
+    site_map = create_site_map_concurrent(fixed_url)
     print(f"site map length: {len(site_map)}")
-    for site in site_map:
-        print(f"Scraping {site}")
-        new_emails = scrape_emails(site)
-        for email in new_emails:
-            if email not in email_addresses:
-                email_addresses.append(email.strip())
-        if (site.lower().find("career") != -1) or (site.find("job") != -1) or (site.find("work-with-us") != -1) or (site.find("join-us") != -1):
-            print(f"Found careers page: {site}")
-            careers_page.append(site)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(scrape_emails, site): site for site in site_map}
+
+        for future in concurrent.futures.as_completed(futures):
+            site = futures[future]
+            try:
+                new_emails = future.result()
+                print(f"Scraping {site}")
+                for email in new_emails:
+                    if email not in email_addresses:
+                        email_addresses.append(email)
+                if any(keyword in site.lower() for keyword in ["career", "job", "work-with-us", "join-us"]):
+                    print(f"Found careers page: {site}")
+                    careers_page.append(site)
+            except Exception as e:
+                print(f"Generated an exception for {site}: {e}")
 
     # Prepare data for CSV writing
     page_data = [
         {
-            "url": url,
+            "url": fixed_url,
             "title": metadata['title'],
             "description": metadata['description'],
             "email_addresses": ",".join(email_addresses) if email_addresses else "",
@@ -56,7 +66,7 @@ def extract_page_info(url):
     ]
 
     # Open or create CSV file
-    with open('output.csv', 'a', newline='', encoding='utf-8') as csvfile:
+    with open('Abby.csv', 'a', newline='', encoding='utf-8') as csvfile:
         fieldnames = ["url", "title", "description", "email_addresses", "careers_page"]
         csv_writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
 
@@ -68,8 +78,23 @@ def extract_page_info(url):
         for row in page_data:
             csv_writer.writerow(row)
 
-    print(f"Data saved to output.csv")
+    print(f"Data saved to Abby.csv")
 
+def get_domain(url):
+    return urlparse(url).netloc
+
+def fix_url(url):
+    # Check if the URL already has a scheme (http or https)
+    if not re.match(r'http[s]?://', url):
+        url = 'http://' + url
+
+    # Parse the URL
+    parsed_url = urlparse(url)
+    
+    # Ensure the scheme is https and strip out the path, params, query, and fragment
+    fixed_url = urlunparse(('https', parsed_url.netloc, '', '', '', ''))
+    
+    return fixed_url
 
 def extract_title(soup):
     title_tag = soup.find('title')
@@ -103,32 +128,40 @@ def extract_emails_from_html(soup):
 
     return emails
 
-def create_site_map(soup, base_url, site_urls):
-    # Get links in the current page
-    for link in soup.find_all('a', href=True):
-           
-        full_link = f"http://{base_url}/{link.get('href')}" if not link.get('href').startswith("http") else link.get('href')
+def scrape_page(url, base_url, site_urls, max_depth, current_depth, queue):
+    try:
+        response = requests.get(url)
+        if response.status_code != 200:
+            return
+
+        soup = BeautifulSoup(response.text, 'html.parser')
+        for link in soup.find_all('a', href=True):
+            full_link = urljoin(base_url, link.get('href'))
+            if get_domain(full_link) == get_domain(base_url) and full_link not in visited_urls:
+                visited_urls.add(full_link)
+                site_urls.append(full_link)
+                if current_depth < max_depth:
+                    queue.append((full_link, current_depth + 1))
+    except Exception as e:
+        print(f"Failed to access {url}: {str(e)}")
+
+def create_site_map_concurrent(base_url, max_depth=3, max_workers=10):
+    site_urls = []
+    visited_urls.add(base_url)
+    queue = deque([(base_url, 0)])
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = []
+        while queue:
+            url, depth = queue.popleft()
+            futures.append(executor.submit(scrape_page, url, base_url, site_urls, max_depth, depth, queue))
         
-        if (get_domain(full_link) == get_domain(base_url)) and (full_link not in visited_urls):
-            visited_urls.append(full_link)
-            site_urls.append(full_link)
+        for future in concurrent.futures.as_completed(futures):
             try:
-                response = requests.get(full_link)
-                if response.status_code == 200:
-                    # Get BeautifulSoup object for the response
-                    soup_subpage = BeautifulSoup(response.text, 'html.parser')
-                    # Recursively check links within this page
-                    for link in soup_subpage.find_all('a', href=True):                        
-                        if not link.get('href').startswith("http"):
-                            full_link = f"http://{base_url}/{link.get('href')}"
-                        else:
-                            link.get('href')
-                        if get_domain(full_link) == get_domain(base_url):                                    
-                            if full_link not in visited_urls:                                    
-                                create_site_map(soup_subpage, full_link, site_urls) 
+                future.result()
             except Exception as e:
-                print(f"Failed to access {full_link}: {str(e)}")
-                continue
+                print(f"Generated an exception: {e}")
+    
     return site_urls
 
 def scrape_emails(site):
@@ -145,34 +178,107 @@ def scrape_emails(site):
             more_emails = extract_emails_from_html(soup_subpage)
             for email in new_emails + more_emails:
                 if email not in emails_found:
-                    emails_found.append(email.strip())                              
+                    emails_found.append(email.lower().strip())                              
     except Exception as e:
         print(f"Failed to access {site}: {str(e)}")
         return []        
     return emails_found
 
 if __name__ == "__main__":
-    urls = [
-        "https://summitdaymedia.com/",
-        "https://www.msialaska.com/",
-        "https://wostmann.com/",
-        "https://www.7oaksgroup.com/",
-        "https://www.flyntlok.com/careers/",
-        "https://kartorium.com",
-        "https://wostmann.com/",
-        "https://queryon.com/",
-        "https://nwds-ak.com",
-        "https://webbres.com/",
-        "https://www.nexusdatasolutions.com/",
-        "https://designori.net/",
-        "https://www.7oaksgroup.com/",
-        "https://grio.com/",
-        "https://www.ctg.com",
-        "https://www.ripcord.com/",
-
-
-        
-        ]  # Replace with the actual URL
+    urls = [    
+  "https://kingwillystudios.com",
+    "https://forefrontcorp.com",
+    "https://redrootmarketing.com",
+    "https://abmarketinggroup.co",
+    "https://privy.io",
+    "https://aviatecreative.com",
+    "https://zipari.com",
+    "https://revelwood.com",
+    "https://techflex.com",
+    "https://informetric.com",
+    "https://storis.com",
+    "https://farmcreditfunding.com",
+    "https://provenir.com",
+    "https://viphomelink.com",
+    "https://earthcam.net",
+    "https://payersciences.com",
+    "https://medfuse.com",
+    "https://epscorp.com",
+    "https://agiliscommerce.com",
+    "https://kiswe.com",
+    "https://gs1us.org",
+    "https://infragistics.com",
+    "https://ets.org",
+    "https://cedar.com",
+    "https://newsela.com",
+    "https://marpipe.com",
+    "https://lumber.dev",
+    "https://magic.link",
+    "https://vimblygroup.com",
+    "https://ambrook.com",
+    "https://asapp.com",
+    "https://gallerymediagroup.com",
+    "https://softheon.com",
+    "https://resortpass.com",
+    "https://ingage.io",
+    "https://parsleyhealth.com",
+    "https://realmhome.com",
+    "https://getgarner.com",
+    "https://charitybuzz.com",
+    "https://ltvco.com",
+    "https://mantl.com",
+    "https://theguarantors.com",
+    "https://sanctuary.computer",
+    "https://artsvision.net",
+    "https://link3.to",
+    "https://otcmarkets.com",
+    "https://ntop.com",
+    "https://resilia.com",
+    "https://equinoxplus.com",
+    "https://yoop.app",
+    "https://staytuned.digital",
+    "https://flashtalking.com",
+    "https://optoinvest.com",
+    "https://public.com",
+    "https://dispel.com",
+    "https://cbinsights.com",
+    "https://informedrepricer.com",
+    "https://getclair.com",
+    "https://usebutton.com",
+    "https://arthur.ai",
+    "https://splashthat.com",
+    "https://xchangeworx.com",
+    "https://candy.com",
+    "https://cipherhealth.com",
+    "https://thelab.co",
+    "https://jetty.com",
+    "https://coreamerica.com",
+    "https://talentinc.com",
+    "https://broadway.com",
+    "https://yikesinc.com",
+    "https://clarifai.com",
+    "https://domandtom.com",
+    "https://esusurent.com",
+    "https://modaoperandi.com",
+    "https://simonsfoundation.org",
+    "https://premierecreative.com",
+    "https://crazygooddigital.com",
+    "https://thebullzeye.com",
+    "https://unifiedmktg.com",
+    "https://blendmarketinggroup.com",
+    "https://rocketscienceweb.com",
+    "https://hatchmarketingagency.com",
+    "https://davidtaylordigital.com",
+    "https://bizmapllc.com",
+    "https://letsbmedia.com",
+    "https://trillioncreative.com",
+    "https://aha.agency",
+    "https://newwebdesign.com",
+    "https://runsignup.com",
+    "https://gotenna.com",
+    "https://grasshopper.bank",
+    "https://websitedesignvalley.com"
+    ]  
     # extract_page_info(url)
     for url in urls:
         extract_page_info(url)
